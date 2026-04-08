@@ -40,6 +40,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.tracking import Tracking
+from verl.utils.http_utils import init_distributed_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +186,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # when use_trainer_do_validate == Ture, use colocate_checkpoint_manager to sync params
         self.colocate_checkpoint_manager = None
+
+        init_distributed_http_client(num_actors_per_node=1, max_connections=-1)
 
     def _setup_checkpoint_manager(self, rollouter):
         """Setup checkpoint manager after rollouter is initialized"""
