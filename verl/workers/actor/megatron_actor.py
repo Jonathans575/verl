@@ -441,7 +441,14 @@ class MegatronPPOActor(BasePPOActor):
             assert max_token_len is not None, "max_token_len must be set when use_dynamic_bsz is True"
             dp_group = mpu.get_data_parallel_group()
             vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
-            if vpp_size is not None and vpp_size > 1:
+            cached_indices = data.meta_info.get("dynamic_bsz_indices", None)
+            if cached_indices is not None:
+                from verl.utils.tensordict_utils import index_select_tensor_dict
+                indices = cached_indices
+                micro_batches = [
+                    index_select_tensor_dict(mini_batch.batch, p) for p in indices
+                ]
+            elif vpp_size is not None and vpp_size > 1:
                 microbatch_group_size_per_vp_stage = self.tf_config.microbatch_group_size_per_vp_stage
                 micro_batches, indices = rearrange_micro_batches(
                     batch=mini_batch.batch,
@@ -799,7 +806,50 @@ class MegatronPPOActor(BasePPOActor):
 
         """
         metrics = {}
-        for data in dataloader:
+        import itertools
+        from verl.utils.seqlen_balancing import get_reverse_idx
+        def _compute_logprobs_fn(output, data, use_dynamic_bsz=False, indices=None):
+            response = data["responses"]
+            response_length = response.size(1)
+            log_probs = output["log_probs"][:, -response_length - 1 : -1].contiguous()
+            return {"log_probs": log_probs}
+
+        all_data = list(dataloader)
+        all_indices = {}  # id(data) -> indices
+
+        if self.config.use_dynamic_bsz:
+            max_token_len = self.config.ppo_max_token_len_per_gpu * self.config.megatron.context_parallel_size
+            for data in all_data:
+                micro_batch_size = data.meta_info.get("micro_batch_size", self.config.ppo_micro_batch_size_per_gpu)
+                with torch.no_grad():
+                    recompute_output = self.forward_backward_batch(
+                        data,
+                        forward_only=True,
+                        post_process_fn=_compute_logprobs_fn,
+                        calculate_entropy=False,
+                        use_dynamic_bsz=True,
+                        micro_batch_size=micro_batch_size,
+                        max_token_len=max_token_len,
+                        mini_batch_size=self.config.ppo_mini_batch_size,
+                    )
+                if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                    new_log_probs = [o["log_probs"] for o in recompute_output["output"]]
+                    new_log_probs = torch.cat(new_log_probs, dim=0).to(torch.float32)
+                    indices = recompute_output["indices"]
+                    flat_indices = list(itertools.chain.from_iterable(indices))
+                    revert_indices = torch.tensor(get_reverse_idx(flat_indices), dtype=torch.long)
+                    new_log_probs = new_log_probs[revert_indices]
+                    data.batch["old_log_probs"] = new_log_probs.to("cpu")
+                data.batch["old_log_probs"] = data.batch["old_log_probs"].to(get_device_id())
+                torch.distributed.broadcast(
+                    tensor=data.batch["old_log_probs"],
+                    src=mpu.get_pipeline_model_parallel_last_rank(),
+                    group=mpu.get_pipeline_model_parallel_group(),
+                    async_op=False,
+                )
+                data.batch["old_log_probs"] = data.batch["old_log_probs"].to("cpu")
+                all_indices[id(data)] = recompute_output["indices"]  # 用id存，不写meta_info
+        for data in all_data:
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             self.actor_optimizer.zero_grad()
@@ -816,6 +866,8 @@ class MegatronPPOActor(BasePPOActor):
             max_token_len = None
             if self.config.use_dynamic_bsz:
                 max_token_len = self.config.ppo_max_token_len_per_gpu * self.config.megatron.context_parallel_size
+                if id(data) in all_indices:
+                    data.meta_info["dynamic_bsz_indices"] = all_indices[id(data)]
             metric_micro_batch = self.forward_backward_batch(
                 data,
                 calculate_entropy=calculate_entropy,
@@ -824,6 +876,7 @@ class MegatronPPOActor(BasePPOActor):
                 max_token_len=max_token_len,
                 mini_batch_size=self.config.ppo_mini_batch_size,
             )
+            data.meta_info.pop("dynamic_bsz_indices", None)
 
             mtp_losses = metric_micro_batch.get("mtp_losses", None)
             if mtp_losses is not None:
